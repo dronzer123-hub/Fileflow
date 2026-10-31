@@ -68,18 +68,19 @@ export const handleInvoice = async ({ job, log }) => {
         coreFieldsFound: foundCore,
         coreFieldsMissing: CORE_FIELDS.filter((key) => !foundCore.includes(key)),
         extraFields: normalized.extraFields.length,
-        unknownLabels, // the labels that keep appearing are the ones to add to the registry
+        unknownLabels: parsed.extras.filter((e) => !e.key).map((e) => e.label), // the labels that keep appearing are the ones to add to the registry
         lineItems: normalized.lineItems.length,
         durationMs: parseMs,
     });
 
     // Stages 4 and 5: check the result and decide how far it can be trusted.
     // (The processor records the final completed / needs-review event.)
-    const validationErrors = validateInvoice({
-        fields: normalized.fields,
-        lineItems: normalized.lineItems,
-        extraFields: normalized.extraFields,
-    });
+   const validationErrors = validateInvoice({
+    fields: normalized.fields,
+    lineItems: normalized.lineItems,
+    extraFields: normalized.extraFields,
+    registry,
+});
 
     const { confidence, needsReview } = computeConfidence({
         fieldConfidence: normalized.fieldConfidence,
