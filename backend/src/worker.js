@@ -7,6 +7,9 @@ import { Job } from "./models/Job.js";
 import { recordEvent } from "./services/event.service.js";
 import { processJob } from "./pipeline/processor.js";
 import { logger } from "./utils/logger.js";
+import { sweepStaleTempDirs } from "./utils/tempFiles.js";
+// ...after connectDB(), before creating the Worker:
+await sweepStaleTempDirs();
 
 const CONCURRENCY = Number(process.env.WORKER_CONCURRENCY) || 1;
 const SHUTDOWN_TIMEOUT_MS = Number(process.env.SHUTDOWN_TIMEOUT_MS) || 60000;

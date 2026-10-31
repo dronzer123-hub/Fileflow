@@ -6,7 +6,7 @@ import { extractContent } from "./extractors/index.js";
 import { parseInvoice } from "./parsers/index.js";
 import { normalizeInvoice } from "./normalizer/index.js";
 import { validateInvoice } from "./validation/validator.js";
-import { computeConfidence } from "./validation/confidence.js";
+import { computeConfidence, fieldPagesFromLines } from "./validation/confidence.js";
 
 const CORE_FIELDS = ["invoiceNumber", "invoiceDate", "vendorName", "totalAmount", "currency"];
 const MIN_TEXT_CHARS = 20; // less than this means nothing readable was found
@@ -25,9 +25,17 @@ export const handleInvoice = async ({ job, log }) => {
     const filePath = await getFilePath(job.storagePath);
     const registry = await getFieldRegistry();
 
-    // Stage 1: get text out of the file (PDF text, or OCR for scans and photos)
+    // Stage 1: get text out of the file (PDF text, or OCR for scans and photos).
+    // jobId names the OCR temp folder; attempt decides how an OCR timeout is treated
+    // (temporary on the first attempt, permanent afterwards).
     const [extracted, extractMs] = await timed(() =>
-        extractContent({ filePath, mimeType: job.mimeType, log })
+        extractContent({
+            filePath,
+            mimeType: job.mimeType,
+            jobId: String(job._id),
+            attempt: job.attempts,
+            log,
+        })
     );
 
     const text = extracted.text ?? "";
@@ -47,14 +55,18 @@ export const handleInvoice = async ({ job, log }) => {
         await recordEvent(job._id, "ocr_used", "OCR was used to read the file.", {
             pages: extracted.ocr.pagesProcessed,
             averageConfidence: extracted.ocr.averageConfidence,
+            confidencePerPage: extracted.ocr.confidencePerPage,
+            lowConfidencePages: extracted.ocr.lowConfidencePages,
             language: extracted.ocr.language,
             durationMs: extracted.ocr.durationMs,
             preprocessing: extracted.ocr.preprocessing,
+            textFixes: extracted.ocr.fixCount,
         });
     }
 
-    // Stages 2 and 3: find the fields, then convert them into one common structure
-    const [parsed, parseMs] = await timed(async () => parseInvoice({ text, registry }));
+    // Stages 2 and 3: find the fields, then convert them into one common structure.
+    // parseInvoice is async (the AI-assisted parser will be), so it must be awaited.
+    const [parsed, parseMs] = await timed(() => parseInvoice({ text, registry }));
     const normalized = normalizeInvoice({ parsed, registry });
 
     const foundCore = CORE_FIELDS.filter((key) => normalized.fields[key] != null);
@@ -68,27 +80,33 @@ export const handleInvoice = async ({ job, log }) => {
         coreFieldsFound: foundCore,
         coreFieldsMissing: CORE_FIELDS.filter((key) => !foundCore.includes(key)),
         extraFields: normalized.extraFields.length,
-        unknownLabels: parsed.extras.filter((e) => !e.key).map((e) => e.label), // the labels that keep appearing are the ones to add to the registry
+        unknownLabels, // the labels that keep appearing are the ones to add to the registry
         lineItems: normalized.lineItems.length,
         durationMs: parseMs,
     });
 
     // Stages 4 and 5: check the result and decide how far it can be trusted.
     // (The processor records the final completed / needs-review event.)
-   const validationErrors = validateInvoice({
-    fields: normalized.fields,
-    lineItems: normalized.lineItems,
-    extraFields: normalized.extraFields,
-    registry,
-});
+    const validationErrors = validateInvoice({
+        fields: normalized.fields,
+        lineItems: normalized.lineItems,
+        extraFields: normalized.extraFields,
+        registry,
+    });
 
-    const { confidence, needsReview, reasons } = computeConfidence({
+    // Which page each core field came from, so a scan's quality scales only the fields read from it
+    const fieldPages = extracted.ocr
+        ? fieldPagesFromLines({ core: parsed.core, pages: extracted.pages })
+        : {};
+
+    const { confidence, needsReview, reasons, fieldConfidence } = computeConfidence({
         fieldConfidence: normalized.fieldConfidence,
         ocr: extracted.ocr,
+        fieldPages,
         validationErrors,
     });
 
-    log.debug({ confidence, needsReview, errors: validationErrors.length }, "Invoice stages finished");
+    log.debug({ confidence, needsReview, reasons }, "Invoice stages finished");
 
     return {
         ...normalized.fields, // invoiceNumber, invoiceDate, vendorName, totalAmount, currency
@@ -97,7 +115,7 @@ export const handleInvoice = async ({ job, log }) => {
         extractionMethod: extracted.method,
         parserUsed: parsed.parserUsed,
         confidence,
-        fieldConfidence: normalized.fieldConfidence,
+        fieldConfidence, // the SCALED values from computeConfidence, not normalized.fieldConfidence
         rawText: text,
         ocrInfo: extracted.ocr
             ? {

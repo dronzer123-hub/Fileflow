@@ -1,5 +1,9 @@
 import path from "path";
-import { Job } from "../models/Job.js";
+import mongoose from "mongoose";
+import { Job, JOB_STATUSES } from "../models/Job.js";
+import { JobEvent } from "../models/JobEvent.js";
+import { ExtractionResult } from "../models/ExtractionResult.js";
+import { User } from "../models/User.js";
 import { recordEvent } from "./event.service.js";
 import { deleteFile } from "./storage.service.js";
 import { addProcessingJob } from "../queue/jobQueue.js";
@@ -125,4 +129,133 @@ export const retryJob = async ({ jobId, ownerId }) => {
 
     await recordEvent(job._id, "retried", "Retry requested.", {});
     return enqueue(job);
+};
+
+// ====================================================================== queries
+
+// Fields the client must never see: where the file lives on the server and the queue's internal id
+const HIDDEN_JOB_FIELDS = "-storagePath -storedName -queueJobId -__v";
+
+// A search like "inv(2024" must be treated as text, not as a regular expression
+const escapeRegex = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+const isObjectId = (value) => mongoose.isValidObjectId(value) && String(value).length === 24;
+
+/**
+ * The caller's jobs, newest first by default.
+ *   ownerId (required), page, limit, status?, jobType?, search? (part of the file name), sort?
+ * Returns { items, total, page, limit, totalPages }
+ */
+export const listJobs = async ({ ownerId, page = 1, limit = 10, status, jobType, search, sort = "newest" }) => {
+    const filter = { owner: ownerId }; // ALWAYS present: this is what keeps users apart
+    if (status) filter.status = status;
+    if (jobType) filter.jobType = jobType;
+    if (search) filter.originalName = { $regex: escapeRegex(search), $options: "i" };
+
+    const direction = sort === "oldest" ? 1 : -1;
+
+    const [items, total] = await Promise.all([
+        Job.find(filter)
+            .select(HIDDEN_JOB_FIELDS)
+            .sort({ createdAt: direction, _id: direction }) // _id breaks ties so pages never repeat or skip a row
+            .skip((page - 1) * limit)
+            .limit(limit)
+            .lean(),
+        Job.countDocuments(filter),
+    ]);
+
+    return { items, total, page, limit, totalPages: Math.ceil(total / limit) };
+};
+
+/**
+ * One job with its extraction result (null until there is one) and its events, oldest first.
+ * Another user's job and a job that does not exist give the SAME 404.
+ */
+export const getJobDetail = async ({ jobId, ownerId }) => {
+    if (!isObjectId(jobId)) throw ApiError.notFound("Job not found.");
+
+    const job = await Job.findOne({ _id: jobId, owner: ownerId }).select(HIDDEN_JOB_FIELDS).lean();
+    if (!job) throw ApiError.notFound("Job not found.");
+
+    const [result, events] = await Promise.all([
+        ExtractionResult.findOne({ job: job._id }).lean(), // rawText is select:false, so it is not included
+        JobEvent.find({ job: job._id }).sort({ createdAt: 1, _id: 1 }).lean(),
+    ]);
+
+    return { job, result, events };
+};
+
+/**
+ * Counts per status for the dashboard cards: { total, byStatus: { queued, processing, ... } }
+ * Every status is present, with 0 when there are none.
+ */
+export const getStats = async ({ ownerId }) => {
+    // aggregate() does NOT cast strings to ObjectId the way find() does
+    const owner = new mongoose.Types.ObjectId(String(ownerId));
+
+    const rows = await Job.aggregate([
+        { $match: { owner } },
+        { $group: { _id: "$status", count: { $sum: 1 } } },
+    ]);
+
+    const byStatus = Object.fromEntries(JOB_STATUSES.map((status) => [status, 0]));
+    for (const { _id, count } of rows) byStatus[_id] = count;
+
+    const total = Object.values(byStatus).reduce((sum, count) => sum + count, 0);
+    return { total, byStatus };
+};
+
+// A job being worked on, or about to be, must not disappear underneath the worker
+const DELETABLE_STATUSES = ["completed", "needs_review", "failed"];
+
+/**
+ * Removes the job, its result, its events and the stored file. Owner only.
+ * Queued and processing jobs cannot be deleted (409): wait until they finish.
+ */
+export const deleteJob = async ({ jobId, ownerId }) => {
+    if (!isObjectId(jobId)) throw ApiError.notFound("Job not found.");
+
+    // One atomic step that checks the owner AND the status AND removes the job, so a retry or a
+    // worker claiming the job at the same moment cannot slip in between a check and a delete.
+    const job = await Job.findOneAndDelete({
+        _id: jobId,
+        owner: ownerId,
+        status: { $in: DELETABLE_STATUSES },
+    }).lean();
+
+    if (!job) {
+        const exists = await Job.exists({ _id: jobId, owner: ownerId });
+        throw exists
+            ? ApiError.conflict("This job is still being processed. Try again when it has finished.")
+            : ApiError.notFound("Job not found.");
+    }
+
+    // The job is gone; clear everything that pointed at it. One failing step must not stop the others,
+    // and leftovers are harmless (nothing references them), so these are logged, not thrown.
+    const cleanup = await Promise.allSettled([
+        JobEvent.deleteMany({ job: job._id }),
+        ExtractionResult.deleteMany({ job: job._id }),
+        deleteFile(job.storagePath),
+        User.updateOne({ _id: ownerId, jobCount: { $gt: 0 } }, { $inc: { jobCount: -1 } }),
+    ]);
+    const labels = ["events", "result", "file", "user counter"];
+    cleanup.forEach((outcome, index) => {
+        if (outcome.status === "rejected") {
+            logger.warn({ err: outcome.reason, jobId: job._id }, `Could not remove ${labels[index]} of a deleted job`);
+        }
+    });
+
+    return { id: String(job._id) };
+};
+
+/**
+ * What the download route needs: where the file is and what to call it. Owner only.
+ * (storagePath is hidden from every other query on purpose; this is the one place it is read.)
+ */
+export const getJobFile = async ({ jobId, ownerId }) => {
+    if (!isObjectId(jobId)) throw ApiError.notFound("Job not found.");
+
+    const job = await Job.findOne({ _id: jobId, owner: ownerId }).select("storagePath originalName mimeType").lean();
+    if (!job) throw ApiError.notFound("Job not found.");
+    return job;
 };

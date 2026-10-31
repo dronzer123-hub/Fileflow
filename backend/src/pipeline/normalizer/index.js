@@ -233,7 +233,7 @@ const normalizeCore = (core = {}) => {
 };
 
 // ---------------------------------------------------------------- extra fields
-const convertByType = (dataType, text) => {
+export const convertByType = (dataType, text) => {
     switch (dataType) {
         case "number": {
             const n = parseNumber(text, "last");

@@ -18,6 +18,9 @@ const ocrInfoFrom = (ocr) => ({
     language: ocr.language,
     durationMs: ocr.durationMs,
     preprocessing: ocr.preprocessing,
+    confidencePerPage: ocr.confidencePerPage,
+    lowConfidencePages: ocr.lowConfidencePages,
+    fixCount: ocr.fixCount,
 });
 
 const lowConfidenceWarning = (ocr) =>
@@ -26,7 +29,7 @@ const lowConfidenceWarning = (ocr) =>
         : [];
 
 // PDFs: use the embedded text where there is any, OCR only the pages that have none
-const extractPdf = async ({ filePath, log }) => {
+const extractPdf = async ({ filePath, jobId, attempt, log }) => {
     const { pages, pageCount } = await extractPdfText(filePath);
 
     const scannedPages = [];
@@ -46,7 +49,7 @@ const extractPdf = async ({ filePath, log }) => {
     }
 
     log.info({ scannedPages, pageCount }, "Some pages have no embedded text: using OCR for them");
-    const ocr = await extractWithOcr({ filePath, kind: "pdf", pageNumbers: scannedPages, log });
+    const ocr = await extractWithOcr({ filePath, kind: "pdf", pageNumbers: scannedPages, jobId, attempt, log });
 
     const ocrTextByPage = new Map(ocr.pages.map((page) => [page.pageNumber, page.text ?? ""]));
     const combined = pages.map((pageText, index) =>
@@ -55,6 +58,7 @@ const extractPdf = async ({ filePath, log }) => {
 
     const warnings = [
         `Page${scannedPages.length > 1 ? "s" : ""} ${scannedPages.join(", ")} had no embedded text and ${scannedPages.length > 1 ? "were" : "was"} read with OCR.`,
+        ...ocr.warnings,
         ...lowConfidenceWarning(ocr),
     ];
 
@@ -68,9 +72,9 @@ const extractPdf = async ({ filePath, log }) => {
     };
 };
 
-// Photos and screenshots: straight to OCR
-const extractImage = async ({ filePath, log }) => {
-    const ocr = await extractWithOcr({ filePath, kind: "image", log });
+// Photos and screenshots: straight to OCR (one page, so no pageNumbers)
+const extractImage = async ({ filePath, jobId, attempt, log }) => {
+    const ocr = await extractWithOcr({ filePath, kind: "image", jobId, attempt, log });
     const text = ocr.pages[0]?.text ?? "";
 
     return {
@@ -78,7 +82,7 @@ const extractImage = async ({ filePath, log }) => {
         pages: [text],
         method: "ocr",
         pageCount: 1,
-        warnings: lowConfidenceWarning(ocr),
+        warnings: [...ocr.warnings, ...lowConfidenceWarning(ocr)],
         ocr: ocrInfoFrom(ocr),
     };
 };
@@ -100,9 +104,9 @@ const extractCsvFile = async ({ filePath }) => {
  * Looks at the real file type and returns:
  *   { text, pages, method: "text" | "ocr" | "hybrid", pageCount, warnings, ocr?, table? }
  */
-export const extractContent = async ({ filePath, mimeType, log }) => {
-    if (mimeType === "application/pdf") return extractPdf({ filePath, log });
-    if (IMAGE_TYPES.includes(mimeType)) return extractImage({ filePath, log });
+export const extractContent = async ({ filePath, mimeType, jobId, attempt, log }) => {
+    if (mimeType === "application/pdf") return extractPdf({ filePath, jobId, attempt, log });
+    if (IMAGE_TYPES.includes(mimeType)) return extractImage({ filePath, jobId, attempt, log });
     if (mimeType === "text/csv") return extractCsvFile({ filePath });
 
     // .xlsx files are accepted at upload but not supported by any extractor yet
