@@ -82,7 +82,7 @@ export const handleInvoice = async ({ job, log }) => {
     registry,
 });
 
-    const { confidence, needsReview } = computeConfidence({
+    const { confidence, needsReview, reasons } = computeConfidence({
         fieldConfidence: normalized.fieldConfidence,
         ocr: extracted.ocr,
         validationErrors,
